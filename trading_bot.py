@@ -375,18 +375,42 @@ def get_universe():
 
 
 def load_many(symbols, years=10):
-    """Download daily bars for many symbols at once. Returns {symbol: DataFrame}."""
+    """
+    Download daily bars for many symbols at once. Returns {symbol: DataFrame}.
+    The bulk download sometimes drops a few tickers at random ('database is locked'),
+    so anything that comes back empty is retried one at a time.
+    """
+    import time
     import yfinance as yf
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    min_len = TRAIN_DAYS + 4 * TEST_DAYS      # need enough history to validate
     raw = yf.download(symbols, period=f"{years}y", auto_adjust=True, group_by="ticker",
                       progress=False, threads=True)
-    out = {}
+    out, dropped = {}, []
     for s in symbols:
         try:
-            d = raw[s][["Open", "High", "Low", "Close", "Volume"]].dropna()
+            d = raw[s][cols].dropna()
         except KeyError:
-            continue
-        if len(d) >= TRAIN_DAYS + 4 * TEST_DAYS:   # need enough history to validate
+            d = None
+        if d is None or d.empty:
+            dropped.append(s)
+        elif len(d) >= min_len:
             out[s] = d
+    for s in dropped:
+        for attempt in range(3):
+            try:
+                d = yf.download(s, period=f"{years}y", auto_adjust=True, progress=False,
+                                threads=False)
+                if isinstance(d.columns, pd.MultiIndex):
+                    d.columns = d.columns.get_level_values(0)
+                d = d[cols].dropna()
+                if len(d) >= min_len:
+                    out[s] = d
+                if not d.empty:
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
     return out
 
 
@@ -416,7 +440,7 @@ def fail_reasons(summary, name):
     return [label for label, ok in checks if not ok]
 
 
-def research(data=None, verbose=True):
+def research(data=None, verbose=True, held=()):
     """
     The bot's own research loop: screen the universe, run the full walk-forward test on each
     candidate, and keep only stocks where a strategy passed on unseen data.
@@ -426,6 +450,7 @@ def research(data=None, verbose=True):
     if data is None:
         data = load_many(universe)
     candidates = screen(data)
+    candidates += [h for h in held if h in data and h not in candidates]  # always re-test holdings
     if verbose:
         print(f"Universe {len(universe)} -> {len(data)} with enough history "
               f"-> {len(candidates)} candidates to test")
@@ -472,7 +497,7 @@ def _val(x):
 
 
 def is_stop_order(o):
-    kind = getattr(o, "order_type", None) or getattr(o, "type", None)
+    kind = getattr(o, "type", None) or getattr(o, "order_type", None)
     return _val(o.side) == "sell" and _val(kind) == "stop"
 
 
@@ -623,7 +648,8 @@ def paper_auto(dry_run=False):
     from alpaca.trading.client import TradingClient
 
     client = TradingClient(os.environ["ALPACA_KEY"], os.environ["ALPACA_SECRET"], paper=True)
-    picks, data, universe = research()
+    positions = {p.symbol: p for p in client.get_all_positions()}
+    picks, data, universe = research(held=list(positions))
 
     account = client.get_account()
     equity, last_equity = float(account.equity), float(account.last_equity)
@@ -631,7 +657,6 @@ def paper_auto(dry_run=False):
         print("Daily kill switch hit. No new trading today.")
         return
 
-    positions = {p.symbol: p for p in client.get_all_positions()}
     orders = _open_orders_by_symbol(client)
 
     # Target share count for every stock we care about.
@@ -656,6 +681,9 @@ def paper_auto(dry_run=False):
     # Stocks we hold (within our universe) that are no longer picked get sold.
     for s in positions:
         if s in universe and s not in targets:
+            if s not in data:
+                print(f"{s}: no price data today, leaving the position unchanged")
+                continue
             targets[s] = 0
             print(f"{s}: no longer passes validation -> sell")
     # Backup stop check from your actual fill price, in case a stop order didn't trigger.
